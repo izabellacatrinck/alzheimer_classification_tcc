@@ -46,6 +46,7 @@ import csv
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Sequence
 
 import numpy as np
 import nibabel as nib
@@ -56,6 +57,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from scipy import ndimage
 from nibabel.processing import resample_from_to
+from step5_entropy_slice_selection import step5_entropy_based_slice_selection
 
 # ─── Configuração de logging ───────────────────────────────────────────────────
 logging.basicConfig(
@@ -65,15 +67,57 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+BAD_MASK_LOW_THRESHOLD = 0.15
+BAD_MASK_HIGH_THRESHOLD = 0.5
+
+
+def collect_subject_files(input_dir: Path, subjects: list[str] | None = None) -> list[tuple[str, str]]:
+    """Coleta exatamente um NIfTI por sujeito."""
+    if subjects is not None:
+        subject_files = []
+        for sid in subjects:
+            candidates = sorted(Path(input_dir).rglob(f"{sid}/*.nii*"))
+            if not candidates:
+                logger.warning(f"Arquivo nÃ£o encontrado para sujeito: {sid}")
+                continue
+            if len(candidates) > 1:
+                logger.warning(
+                    f"[{sid}] MÃºltiplos NIfTI encontrados ({len(candidates)}). "
+                    f"Usando apenas: {candidates[0].name}"
+                )
+            subject_files.append((sid, str(candidates[0])))
+        return subject_files
+
+    grouped_files: dict[str, list[Path]] = {}
+    for nii_path in sorted(Path(input_dir).rglob('*.nii*')):
+        grouped_files.setdefault(nii_path.parent.name, []).append(nii_path)
+
+    subject_files = []
+    for sid, candidates in sorted(grouped_files.items()):
+        if len(candidates) > 1:
+            logger.warning(
+                f"[{sid}] MÃºltiplos NIfTI encontrados ({len(candidates)}). "
+                f"Usando apenas: {candidates[0].name}"
+            )
+        subject_files.append((sid, str(candidates[0])))
+    return subject_files
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # UTILITÁRIOS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_cmd(cmd: str, subject_id: str = "") -> bool:
-    """Executa comando shell com log. Retorna True se bem-sucedido."""
-    logger.info(f"[{subject_id}] CMD: {cmd}")
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+def run_cmd(cmd: str | Sequence[str], subject_id: str = "") -> bool:
+    """Executa comando externo com log. Retorna True se bem-sucedido."""
+    is_shell_cmd = isinstance(cmd, str)
+    cmd_display = cmd if is_shell_cmd else " ".join(str(part) for part in cmd)
+    logger.info(f"[{subject_id}] CMD: {cmd_display}")
+    result = subprocess.run(
+        cmd,
+        shell=is_shell_cmd,
+        capture_output=True,
+        text=True,
+    )
     if result.returncode != 0:
         logger.error(f"[{subject_id}] ERRO: {result.stderr.strip()}")
         return False
@@ -85,6 +129,25 @@ def load_nifti(path: Path):
     img = nib.load(str(path))
     data = img.get_fdata(dtype=np.float32)
     return img, data, img.affine, img.header
+
+
+def validate_nifti_output(path: Path, subject_id: str, label: str) -> bool:
+    """Valida se um NIfTI de saída existe, não está vazio e pode ser lido."""
+    if not path.exists():
+        logger.error(f"[{subject_id}] {label} não foi gerado: {path}")
+        return False
+
+    if path.stat().st_size == 0:
+        logger.error(f"[{subject_id}] {label} foi gerado vazio: {path}")
+        return False
+
+    try:
+        nib.load(str(path))
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"[{subject_id}] {label} inválido/corrompido: {exc}")
+        return False
+
+    return True
 
 
 def save_nifti(data: np.ndarray, affine: np.ndarray, header, out_path: Path):
@@ -113,6 +176,46 @@ def save_slice(slice_data, path_npy, path_png):
 
     plt.imsave(path_png, sl, cmap='gray')
 
+
+def generate_manual_review_report(all_results: list, output_dir: Path):
+    """Salva relatório consolidado dos sujeitos que exigem revisão manual."""
+    review_dir = output_dir / 'manual_review'
+    review_dir.mkdir(exist_ok=True)
+
+    review_rows = []
+    for result in all_results:
+        review_flags = result.get('review_flags', [])
+        status = result.get('status', 'UNKNOWN')
+        needs_manual_review = bool(review_flags) or status not in {'SUCCESS', 'SUCCESS_WITH_REVIEW'}
+        if not needs_manual_review:
+            continue
+
+        combined_flags = list(review_flags)
+        if status not in {'SUCCESS', 'SUCCESS_WITH_REVIEW'}:
+            combined_flags.append(f"PIPELINE_STATUS_{status}")
+
+        review_rows.append({
+            'subject_id': result['subject_id'],
+            'status': status,
+            'brain_ratio': result.get('brain_ratio'),
+            'review_flags': " | ".join(combined_flags),
+            'notes': result.get('review_notes', ''),
+        })
+
+    if not review_rows:
+        logger.info("Nenhum sujeito sinalizado para revisão manual.")
+        return
+
+    csv_path = review_dir / 'subjects_for_manual_review.csv'
+    pd.DataFrame(review_rows).to_csv(csv_path, index=False)
+
+    txt_path = review_dir / 'subjects_for_manual_review.txt'
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        for row in review_rows:
+            f.write(f"{row['subject_id']}\n")
+
+    logger.info(f"Relatório de revisão manual salvo → {csv_path}")
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ETAPA 1 — MOTION CORRECTION (FSL FLIRT, registro rígido 6 DOF → MNI152)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -128,17 +231,19 @@ def step1_motion_correction(input_path: Path, output_path: Path,
     """
     mat_path = output_path.parent / f"{subject_id}_mc.mat"
 
-    cmd = (
-        f"flirt "
-        f"-in {input_path} "
-        f"-ref {mni_template} "
-        f"-out {output_path} "
-        f"-omat {mat_path} "
-        f"-dof 6 "
-        f"-interp trilinear "
-        f"-cost mutualinfo "
-        f"-searchrx -30 30 -searchry -30 30 -searchrz -30 30"
-    )
+    cmd = [
+        "flirt",
+        "-in", str(input_path),
+        "-ref", str(mni_template),
+        "-out", str(output_path),
+        "-omat", str(mat_path),
+        "-dof", "6",
+        "-interp", "trilinear",
+        "-cost", "mutualinfo",
+        "-searchrx", "-30", "30",
+        "-searchry", "-30", "30",
+        "-searchrz", "-30", "30",
+    ]
     success = run_cmd(cmd, subject_id)
     if success:
         logger.info(f"[{subject_id}] Etapa 1 concluída → {output_path.name}")
@@ -164,14 +269,14 @@ def step2_skull_stripping(input_path: Path, output_path: Path,
     Literatura: Isensee et al. 2019, Human Brain Mapping
     """
     # HD-BET gera automaticamente a máscara junto com a imagem
-    cmd = (
-    f"hd-bet "
-    f"-i {input_path} "
-    f"-o {output_path} "
-    f"-device cuda "
-    f"--disable_tta "
-    f"--save_bet_mask"
-)
+    cmd = [
+        "hd-bet",
+        "-i", str(input_path),
+        "-o", str(output_path),
+        "-device", "cuda",
+        "--disable_tta",
+        "--save_bet_mask",
+    ]
     success = run_cmd(cmd, subject_id)
     if success:
         logger.info(f"[{subject_id}] Etapa 2 concluída → {output_path.name}")
@@ -196,6 +301,7 @@ def step3_intensity_normalization(input_path: Path, mask_path: Path,
     A combinação N4 + Z-score é o padrão ouro para pipelines multi-scanner.
     """
     # ── 3a. N4 Bias Field Correction via ANTsPy ────────────────────────────
+    n4_path = output_path.parent / f"{subject_id}_n4.nii.gz"
     try:
         import ants
         img_ants = ants.image_read(str(input_path))
@@ -208,28 +314,33 @@ def step3_intensity_normalization(input_path: Path, mask_path: Path,
             convergence={'iters': [50, 50, 50, 50], 'tol': 1e-07},
             spline_param=200
         )
-        n4_path = output_path.parent / f"{subject_id}_n4.nii.gz"
         ants.image_write(n4_result, str(n4_path))
         logger.info(f"[{subject_id}] N4 bias correction concluída")
 
-    except ImportError:
-        # Fallback: N4 via linha de comando ANTs
-        n4_path = output_path.parent / f"{subject_id}_n4.nii.gz"
-        cmd = (
-            f"N4BiasFieldCorrection "
-            f"-d 3 "
-            f"-i {input_path} "
-            f"-x {mask_path} "
-            f"-o {n4_path} "
-            f"--shrink-factor 4 "
-            f"--convergence [50x50x50x50,1e-7]"
-        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[{subject_id}] ANTsPy falhou no N4 ({exc}). Tentando fallback via CLI.")
+        cmd = [
+            "N4BiasFieldCorrection",
+            "-d", "3",
+            "-i", str(input_path),
+            "-x", str(mask_path),
+            "-o", str(n4_path),
+            "--shrink-factor", "4",
+            "--convergence", "[50x50x50x50,1e-7]",
+        ]
         if not run_cmd(cmd, subject_id):
             return False
 
+    if not validate_nifti_output(n4_path, subject_id, "Saida do N4 bias correction"):
+        return False
+
     # ── 3b. Z-score intra-máscara ─────────────────────────────────────────
-    img_n4, data_n4, affine, header = load_nifti(n4_path)
-    _, mask_data, _, _ = load_nifti(mask_path)
+    try:
+        img_n4, data_n4, affine, header = load_nifti(n4_path)
+        _, mask_data, _, _ = load_nifti(mask_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"[{subject_id}] Erro ao carregar NIfTI após N4: {exc}")
+        return False
 
     # Garante máscara binária (HD-BET pode gerar probabilística)
     mask_bin = (mask_data > 0.5).astype(np.uint8)
@@ -343,77 +454,23 @@ def step5_slice_extraction(input_path: Path,
                           mask_path: Path,
                           output_dir: Path,
                           subject_id: str,
-                          n_slices: int = 20):
+                          n_slices: int = 20) -> bool:
     """
-    NOVO: Slice extraction baseada em conteúdo cerebral
-
-    - Seleciona apenas slices com cérebro suficiente
-    - Evita slices vazios ou irrelevantes
+    Wrapper que utiliza o módulo de seleção inteligente de fatias
+    baseado em entropia, mantendo a interface do pipeline.
     """
-
-    _, data, _, _ = load_nifti(input_path)
-    _, mask, _, _ = load_nifti(mask_path)
-
-    def select_informative_slices(mask_volume, axis, n_slices):
-        scores = []
-
-        for i in range(mask_volume.shape[axis]):
-            if axis == 0:
-                slice_mask = mask_volume[i, :, :]
-            elif axis == 1:
-                slice_mask = mask_volume[:, i, :]
-            else:
-                slice_mask = mask_volume[:, :, i]
-
-            brain_pixels = np.sum(slice_mask > 0.5)
-            scores.append((i, brain_pixels))
-
-        scores.sort(key=lambda x: x[1], reverse=True)
-
-        # 🔥 DISTRIBUIÇÃO ao invés de pegar só os top
-        selected_positions = np.linspace(0, len(scores)-1, n_slices).astype(int)
-        selected = [scores[i][0] for i in selected_positions]
-
-        return sorted(selected)
-
-    axial_idx = select_informative_slices(mask, axis=2, n_slices=n_slices)
-    coronal_idx = select_informative_slices(mask, axis=1, n_slices=n_slices)
-    sagittal_idx = select_informative_slices(mask, axis=0, n_slices=n_slices)
-
-    axial_dir = output_dir / "axial"
-    coronal_dir = output_dir / "coronal"
-    sagittal_dir = output_dir / "sagittal"
-
-    axial_dir.mkdir(exist_ok=True)
-    coronal_dir.mkdir(exist_ok=True)
-    sagittal_dir.mkdir(exist_ok=True)
-
-    for i, idx in enumerate(axial_idx):
-        sl = data[:, :, idx]
-
-        save_slice(
-            sl,
-            axial_dir / f"{subject_id}_axial_{i:02d}.npy",
-            axial_dir / f"{subject_id}_axial_{i:02d}.png"
-        )
-
-    for i, idx in enumerate(coronal_idx):
-        sl = data[:, idx, :]
-        save_slice(
-            sl,
-            coronal_dir / f"{subject_id}_coronal_{i:02d}.npy",
-            coronal_dir / f"{subject_id}_coronal_{i:02d}.png"
-        )
-
-    for i, idx in enumerate(sagittal_idx):
-        sl = data[idx, :, :]
-        save_slice(
-            sl,
-            sagittal_dir / f"{subject_id}_sagittal_{i:02d}.npy",
-            sagittal_dir / f"{subject_id}_sagittal_{i:02d}.png"
-        )
-
-    logger.info(f"[{subject_id}] Slice extraction inteligente concluída")
+    logger.info(f"[{subject_id}] Iniciando Step 5 com seleção de fatias por entropia")
+    success = step5_entropy_based_slice_selection(
+        input_path=input_path,
+        mask_path=mask_path,
+        output_dir=output_dir,
+        subject_id=subject_id,
+        n_segments=n_slices,
+        use_pretrained=False,
+    )
+    if not success:
+        logger.error(f"[{subject_id}] Step 5 falhou na seleção de fatias por entropia")
+    return success
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -578,6 +635,9 @@ def process_subject(args_tuple) -> dict:
 
     input_path = Path(input_file)
     all_metrics = []
+    review_flags = []
+    review_notes = []
+    brain_ratio = None
 
     # ── Caminhos de saída por etapa ────────────────────────────────────────
     p = {
@@ -648,11 +708,19 @@ def process_subject(args_tuple) -> dict:
     # 🔹 Validação: proporção de cérebro
     brain_ratio = np.sum(mask_bin) / mask_bin.size
 
-    if brain_ratio < 0.15 or brain_ratio > 0.5:
-        logger.error(f"[{subject_id}] Máscara inválida! brain_ratio={brain_ratio:.3f}")
-        return {'subject_id': subject_id, 'status': 'FAILED_bad_mask', 'metrics': all_metrics}
+    if brain_ratio < BAD_MASK_LOW_THRESHOLD or brain_ratio > BAD_MASK_HIGH_THRESHOLD:
+        logger.warning(
+            f"[{subject_id}] Máscara suspeita para revisão manual: "
+            f"brain_ratio={brain_ratio:.3f} fora de [{BAD_MASK_LOW_THRESHOLD:.2f}, {BAD_MASK_HIGH_THRESHOLD:.2f}]"
+        )
+        review_flags.append('BAD_MASK_REVIEW')
+        review_notes.append(
+            f"brain_ratio={brain_ratio:.3f} fora do intervalo "
+            f"[{BAD_MASK_LOW_THRESHOLD:.2f}, {BAD_MASK_HIGH_THRESHOLD:.2f}]"
+        )
 
     qc2 = compute_qc_metrics(p['ss'], p['ss_mask'], subject_id, 'step2_skull_strip')
+    qc2['brain_ratio'] = round(float(brain_ratio), 4)
     all_metrics.append(qc2)
     if generate_mosaics:
         save_qc_mosaic(p['ss'], subject_id, 'step2_ss', qc_dir)
@@ -706,15 +774,25 @@ def process_subject(args_tuple) -> dict:
 
     # ── Etapa 5: Slice Extraction ─────────────────────────────────────────────
     logger.info(f"[{subject_id}] === Iniciando Etapa 5: Slice Extraction ===")
-    step5_slice_extraction(
-    input_path=p['resampled'],
-    mask_path=p['resampled_mask'],
-    output_dir=subj_dir,
-    subject_id=subject_id
-)
+    ok5 = step5_slice_extraction(
+        input_path=p['resampled'],
+        mask_path=p['resampled_mask'],
+        output_dir=subj_dir,
+        subject_id=subject_id
+    )
+    if not ok5:
+        return {'subject_id': subject_id, 'status': 'FAILED_step5', 'metrics': all_metrics}
 
-    logger.info(f"[{subject_id}] Pipeline concluído com sucesso → {p['final'].name}")
-    return {'subject_id': subject_id, 'status': 'SUCCESS', 'metrics': all_metrics}
+    final_status = 'SUCCESS_WITH_REVIEW' if review_flags else 'SUCCESS'
+    logger.info(f"[{subject_id}] Pipeline concluído com sucesso → status={final_status}")
+    return {
+        'subject_id': subject_id,
+        'status': final_status,
+        'metrics': all_metrics,
+        'brain_ratio': round(float(brain_ratio), 4) if brain_ratio is not None else None,
+        'review_flags': review_flags,
+        'review_notes': " | ".join(review_notes),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -869,18 +947,46 @@ def main():
                     logger.info(f"[{sid}] Status final: {status}")
                 except Exception as e:
                     logger.error(f"[{sid}] Exceção inesperada: {e}")
-                    all_results.append({'subject_id': sid, 'status': f'EXCEPTION: {e}', 'metrics': []})
+                    all_results.append({
+                        'subject_id': sid,
+                        'status': f'EXCEPTION: {e}',
+                        'metrics': [],
+                        'review_flags': [],
+                        'review_notes': '',
+                        'brain_ratio': None,
+                    })
     else:
         for task in tasks:
-            result = process_subject(task)
-            all_results.append(result)
+            sid = task[0]
+            try:
+                result = process_subject(task)
+                all_results.append(result)
+                status = result.get('status', 'UNKNOWN')
+                logger.info(f"[{sid}] Status final: {status}")
+            except Exception as e:
+                logger.error(f"[{sid}] ExceÃ§Ã£o inesperada: {e}")
+                all_results.append({
+                    'subject_id': sid,
+                    'status': f'EXCEPTION: {e}',
+                    'metrics': [],
+                    'review_flags': [],
+                    'review_notes': '',
+                    'brain_ratio': None,
+                })
 
     # ── Gera relatório de QC ───────────────────────────────────────────────
     generate_qc_report(all_results, output_dir)
+    generate_manual_review_report(all_results, output_dir)
 
     # ── Salva log de status geral ──────────────────────────────────────────
     status_log = output_dir / 'pipeline_status.json'
-    summary = [{'subject_id': r['subject_id'], 'status': r['status']} for r in all_results]
+    summary = [{
+        'subject_id': r['subject_id'],
+        'status': r['status'],
+        'brain_ratio': r.get('brain_ratio'),
+        'review_flags': r.get('review_flags', []),
+        'review_notes': r.get('review_notes', ''),
+    } for r in all_results]
     with open(str(status_log), 'w') as f:
         json.dump(summary, f, indent=2)
     logger.info(f"Status geral salvo → {status_log}")
